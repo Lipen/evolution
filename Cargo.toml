@@ -10,3 +10,7 @@ rand = "0.8.5"
 ordered-float = "3.7.0"
 serde = { version = "1.0", features = ["derive"] }
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
+color-eyre = "0.6.2"
+kdam = "0.4.0"
+envmnt = "0.10.4"
+flate2 = "1.0"

@@ -1,18 +1,21 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 use std::time::Instant;
 
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use kdam::{BarExt, tqdm};
 use ordered_float::OrderedFloat;
+use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 const GENOME_SIZE: usize = 20;
-const IS_PLUS: bool = true; // (1+1) vs (1,1)
-const POPULATION_SIZE: usize = 10; // \mu
+const IS_PLUS: bool = false; // (1+1) vs (1,1)
+const POPULATION_SIZE: usize = 50; // \mu
 const NUM_GENERATIONS: usize = 10000;
 const MAX_FITNESS: f64 = GENOME_SIZE as f64;
 
@@ -64,6 +67,7 @@ impl Individual {
             // Update global cache:
             cache.insert(self.genome.clone(), score);
         }
+        debug_assert!(self.score.is_some());
     }
 
     pub fn mutate(&mut self, rng: &mut impl Rng) {
@@ -144,24 +148,23 @@ impl Cache {
 
     // Load the cache from a file
     pub fn load_from_file(file_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = File::open(file_path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
+        let file = File::open(file_path)?;
+        let mut decoder = GzDecoder::new(file);
         let config = bincode::config::standard();
-        let (cache, _) = bincode::serde::decode_from_slice(&buffer, config)?;
+        let cache = bincode::serde::decode_from_std_read(&mut decoder, config)?;
         Ok(cache)
     }
 
     // Save the cache into a file
     pub fn save_to_file(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let config = bincode::config::standard();
-        let serialized = bincode::serde::encode_to_vec(self, config)?;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(file_path)?;
-        file.write_all(&serialized)?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        let config = bincode::config::standard();
+        bincode::serde::encode_into_std_write(self, &mut encoder, config)?;
         Ok(())
     }
 }
@@ -178,21 +181,6 @@ impl Cache {
 
 fn compute_score(individual: &mut Individual, cache: &mut Cache) {
     individual.compute_score(cache)
-}
-
-fn evaluate_all(population: &mut [Individual], cache: &mut Cache) {
-    // Evaluate the new population
-    for individual in population.iter_mut() {
-        compute_score(individual, cache);
-    }
-
-    // Sort the population by fitness (and count, for equal fitness) in descending order (max first):
-    population.sort_by_key(|x| {
-        let score = x.score.unwrap();
-        let f = OrderedFloat(score.fitness);
-        let c = score.count;
-        Reverse((f, c))
-    });
 }
 
 fn two_point_crossover(
@@ -236,10 +224,10 @@ fn mutate(individual: &mut Individual, rng: &mut impl Rng) {
     individual.mutate(rng)
 }
 
-pub fn run() {
+pub fn run() -> std::io::Result<()> {
     let start_time = Instant::now();
 
-    let use_file_cache = std::env::var("USE_FILE_CACHE").is_ok();
+    let use_file_cache = envmnt::is("USE_FILE_CACHE");
     println!("USE_FILE_CACHE: {}", use_file_cache);
 
     // Create a new cache or load an existing one:
@@ -249,7 +237,10 @@ pub fn run() {
                 println!("Loaded cache with {} entries", cache.data.len());
                 cache
             }
-            Err(_) => Cache::new(),
+            Err(e) => {
+                println!("Error loading the cache: {}", e);
+                Cache::new()
+            }
         }
     } else {
         Cache::new()
@@ -266,33 +257,27 @@ pub fn run() {
         compute_score(individual, &mut cache);
     }
 
-    // Sort the initial population:
+    // Sort the initial population in descending order (max first):
     population.sort_by_key(|x| Reverse(x.score.unwrap()));
-
-    println!("Initial generation of size {}:", population.len());
-    for individual in population.iter() {
-        println!(
-            "  - {} (fitness = {}, count = {})",
-            individual.bitstring(),
-            individual.score.unwrap().fitness,
-            individual.score.unwrap().count
-        );
-    }
-    println!(
-        "[0/{}] Best individual has fitness {}: {}",
-        NUM_GENERATIONS,
-        population[0].score.unwrap().fitness,
-        population[0].bitstring()
-    );
 
     let mut best = population[0].clone();
     let mut best_score = population[0].score.unwrap();
     let mut best_generation = 0;
 
+    println!("Initial generation has size {}", population.len());
+    println!(
+        "Best initial individual has fitness {}: {}",
+        best_score.fitness,
+        best.bitstring()
+    );
+
     // Check if the stopping condition is met:
     if (population[0].score.unwrap().fitness - MAX_FITNESS).abs() < f64::EPSILON {
         println!("[!] Initial population already has max fitness");
     }
+
+    println!("Running EA for {} generations...", NUM_GENERATIONS);
+    let mut pb = tqdm!(total = NUM_GENERATIONS);
 
     for generation in 1..=NUM_GENERATIONS {
         // Inner loop:
@@ -331,7 +316,7 @@ pub fn run() {
             population = offspring;
         }
 
-        // Sort the population by fitness (and count, for equal fitness) in descending order (max first):
+        // Sort the population in descending order (max first):
         population.sort_by_key(|x| Reverse(x.score.unwrap()));
 
         // Select best individuals:
@@ -344,19 +329,22 @@ pub fn run() {
             best_generation = generation;
         }
 
-        // Report:
+        // Progress:
+        // pb.set_description(format!("GEN {}", generation));
+        pb.update(1)?;
+
         if generation <= 10
             || (generation < 100 && generation % 10 == 0)
             || (generation < 1000 && generation % 100 == 0)
             || (generation % 1000 == 0)
         {
-            println!(
+            pb.write(format!(
                 "[{}/{}] Best individual has fitness {}: {}",
                 generation,
                 NUM_GENERATIONS,
                 population[0].score.unwrap().fitness,
                 population[0].bitstring()
-            );
+            ))?;
         }
 
         // Check if the stopping condition is met:
@@ -365,6 +353,9 @@ pub fn run() {
             break;
         }
     }
+
+    pb.refresh()?;
+    eprintln!();
 
     println!("\n-----------------\n");
     println!(
@@ -385,5 +376,7 @@ pub fn run() {
         "All done in {}.{:03} s",
         elapsed.as_secs(),
         elapsed.subsec_millis()
-    )
+    );
+
+    Ok(())
 }
