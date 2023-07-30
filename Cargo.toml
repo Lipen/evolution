@@ -1,6 +1,7 @@
 [package]
 name = "evolution"
 version = "0.1.0"
+authors = ["Konstantin Chukharev <lipen00@gmail.com>"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -14,3 +15,4 @@ color-eyre = "0.6.2"
 kdam = "0.4.0"
 envmnt = "0.10.4"
 flate2 = "1.0"
+clap = { version = "4.3.19", features = ["derive"] }

@@ -3,21 +3,15 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::time::Instant;
 
-use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use kdam::{BarExt, tqdm};
+use flate2::Compression;
+use kdam::{tqdm, BarExt};
 use ordered_float::OrderedFloat;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-
-const GENOME_SIZE: usize = 20;
-const IS_PLUS: bool = false; // (1+1) vs (1,1)
-const POPULATION_SIZE: usize = 50; // \mu
-const NUM_GENERATIONS: usize = 10000;
-const MAX_FITNESS: f64 = GENOME_SIZE as f64;
 
 #[derive(Debug)]
 struct Individual {
@@ -85,11 +79,8 @@ impl Individual {
         other: &Individual,
         rng: &mut impl Rng,
     ) -> (Individual, Individual) {
-        debug_assert_eq!(self.genome.len(), GENOME_SIZE);
-        debug_assert_eq!(other.genome.len(), GENOME_SIZE);
-
-        let left = rng.gen_range(0..GENOME_SIZE);
-        let right = rng.gen_range(left..=GENOME_SIZE);
+        let left = rng.gen_range(0..self.genome.len());
+        let right = rng.gen_range(left..=self.genome.len());
 
         let mut child1 = self.clone();
         let mut child2 = other.clone();
@@ -191,16 +182,18 @@ fn two_point_crossover(
     parent1.two_point_crossover(parent2, rng)
 }
 
-fn initial_population(rng: &mut impl Rng) -> Vec<Individual> {
-    (0..POPULATION_SIZE)
-        .map(|_| Individual::new_random(GENOME_SIZE, rng))
+fn initial_population(
+    genome_size: usize,
+    population_size: usize,
+    rng: &mut impl Rng,
+) -> Vec<Individual> {
+    (0..population_size)
+        .map(|_| Individual::new_random(genome_size, rng))
         .collect()
 }
 
 fn generate_offspring(population: &[Individual], rng: &mut impl Rng) -> Vec<Individual> {
-    debug_assert_eq!(population.len(), POPULATION_SIZE);
-
-    let mut new_population = Vec::with_capacity(POPULATION_SIZE);
+    let mut new_population = Vec::with_capacity(population.len());
 
     let mut indices: Vec<usize> = (0..population.len()).collect();
     indices.shuffle(rng);
@@ -216,7 +209,7 @@ fn generate_offspring(population: &[Individual], rng: &mut impl Rng) -> Vec<Indi
         new_population.push(child2);
     }
 
-    debug_assert_eq!(new_population.len(), POPULATION_SIZE);
+    debug_assert_eq!(new_population.len(), population.len());
     new_population
 }
 
@@ -224,7 +217,12 @@ fn mutate(individual: &mut Individual, rng: &mut impl Rng) {
     individual.mutate(rng)
 }
 
-pub fn run() -> std::io::Result<()> {
+pub fn run(
+    genome_size: usize,
+    population_size: usize,
+    num_generations: usize,
+    is_plus: bool,
+) -> std::io::Result<()> {
     let start_time = Instant::now();
 
     let use_file_cache = envmnt::is("USE_FILE_CACHE");
@@ -246,11 +244,14 @@ pub fn run() -> std::io::Result<()> {
         Cache::new()
     };
 
+    // Determine the max fitness:
+    let max_fitness = genome_size as f64;
+
     // Seeded random generator:
     let mut rng = StdRng::seed_from_u64(42);
 
     // Create an initial population:
-    let mut population = initial_population(&mut rng);
+    let mut population = initial_population(genome_size, population_size, &mut rng);
 
     // Evaluate the initial population:
     for individual in population.iter_mut() {
@@ -272,14 +273,14 @@ pub fn run() -> std::io::Result<()> {
     );
 
     // Check if the stopping condition is met:
-    if (population[0].score.unwrap().fitness - MAX_FITNESS).abs() < f64::EPSILON {
+    if (population[0].score.unwrap().fitness - max_fitness).abs() < f64::EPSILON {
         println!("[!] Initial population already has max fitness");
     }
 
-    println!("Running EA for {} generations...", NUM_GENERATIONS);
-    let mut pb = tqdm!(total = NUM_GENERATIONS);
+    println!("Running EA for {} generations...", num_generations);
+    let mut pb = tqdm!(total = num_generations);
 
-    for generation in 1..=NUM_GENERATIONS {
+    for generation in 1..=num_generations {
         // Inner loop:
         //   - produce offspring:
         //      - select parents
@@ -308,7 +309,7 @@ pub fn run() -> std::io::Result<()> {
         }
 
         // Update the population:
-        if IS_PLUS {
+        if is_plus {
             // (\mu + \lambda)
             population.extend(offspring);
         } else {
@@ -320,7 +321,7 @@ pub fn run() -> std::io::Result<()> {
         population.sort_by_key(|x| Reverse(x.score.unwrap()));
 
         // Select best individuals:
-        population.truncate(POPULATION_SIZE);
+        population.truncate(population_size);
 
         // Update the best found individual:
         if population[0].score.unwrap().fitness > best_score.fitness {
@@ -336,20 +337,21 @@ pub fn run() -> std::io::Result<()> {
         if generation <= 10
             || (generation < 100 && generation % 10 == 0)
             || (generation < 1000 && generation % 100 == 0)
-            || (generation % 1000 == 0)
+            || (generation < 10000 && generation % 1000 == 0)
+            || (generation % 10000 == 0)
         {
             pb.write(format!(
                 "[{}/{}] Best individual has fitness {}: {}",
                 generation,
-                NUM_GENERATIONS,
+                num_generations,
                 population[0].score.unwrap().fitness,
                 population[0].bitstring()
             ))?;
         }
 
         // Check if the stopping condition is met:
-        if (population[0].score.unwrap().fitness - MAX_FITNESS).abs() < f64::EPSILON {
-            println!("Reached max fitness on generation {}", generation);
+        if (population[0].score.unwrap().fitness - max_fitness).abs() < f64::EPSILON {
+            pb.write(format!("Reached max fitness on generation {}", generation))?;
             break;
         }
     }
