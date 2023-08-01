@@ -1,186 +1,14 @@
-use std::cmp::{Ordering, Reverse};
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::cmp::Reverse;
 use std::time::Instant;
 
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use kdam::{tqdm, BarExt};
 use ordered_float::OrderedFloat;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
-struct Individual {
-    genome: Vec<bool>,
-    pub score: Option<Score>,
-}
-
-impl Individual {
-    pub fn new(genome: Vec<bool>) -> Self {
-        Self {
-            genome,
-            score: None,
-        }
-    }
-
-    pub fn new_random(size: usize, rng: &mut impl Rng) -> Self {
-        let genome = (0..size).map(|_| rng.gen()).collect();
-        Self::new(genome)
-    }
-}
-
-impl Clone for Individual {
-    fn clone(&self) -> Self {
-        Self::new(self.genome.clone())
-    }
-}
-
-impl Individual {
-    pub fn bitstring(&self) -> String {
-        self.genome
-            .iter()
-            .map(|&b| if b { '1' } else { '0' })
-            .collect()
-    }
-
-    pub fn compute_score(&mut self, cache: &mut Cache) {
-        if let Some(cached) = cache.get(&self.genome) {
-            // Overwrite the stored score:
-            self.score = Some(*cached);
-        } else {
-            let score = *self.score.get_or_insert_with(|| {
-                // Compute the fitness here:
-                let count = self.genome.iter().filter(|x| **x).count();
-                let fitness = count as f64;
-                Score { fitness, count }
-            });
-            // Update global cache:
-            cache.insert(self.genome.clone(), score);
-        }
-        debug_assert!(self.score.is_some());
-    }
-
-    pub fn mutate(&mut self, rng: &mut impl Rng) {
-        let n = self.genome.len();
-        let p = 1.0 / (n as f64);
-        for i in 0..n {
-            if rng.gen::<f64>() < p {
-                self.genome[i] = !self.genome[i];
-            }
-        }
-    }
-
-    pub fn two_point_crossover(
-        &self,
-        other: &Individual,
-        rng: &mut impl Rng,
-    ) -> (Individual, Individual) {
-        let left = rng.gen_range(0..self.genome.len());
-        let right = rng.gen_range(left..=self.genome.len());
-
-        let mut child1 = self.clone();
-        let mut child2 = other.clone();
-
-        for i in left..right {
-            std::mem::swap(&mut child1.genome[i], &mut child2.genome[i]);
-        }
-
-        (child1, child2)
-    }
-}
-
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-struct Score {
-    pub fitness: f64,
-    pub count: usize,
-}
-
-impl Score {
-    fn key(&self) -> (OrderedFloat<f64>, usize) {
-        (OrderedFloat(self.fitness), self.count)
-    }
-}
-
-impl Eq for Score {}
-
-impl PartialEq for Score {
-    fn eq(&self, other: &Self) -> bool {
-        self.key().eq(&other.key())
-    }
-}
-
-impl Ord for Score {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key().cmp(&other.key())
-    }
-}
-
-impl PartialOrd for Score {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Cache {
-    data: HashMap<Vec<bool>, Score>,
-}
-
-impl Cache {
-    pub fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-        }
-    }
-
-    // Load the cache from a file
-    pub fn load_from_file(file_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(file_path)?;
-        let mut decoder = GzDecoder::new(file);
-        let config = bincode::config::standard();
-        let cache = bincode::serde::decode_from_std_read(&mut decoder, config)?;
-        Ok(cache)
-    }
-
-    // Save the cache into a file
-    pub fn save_to_file(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(file_path)?;
-        let mut encoder = GzEncoder::new(file, Compression::default());
-        let config = bincode::config::standard();
-        bincode::serde::encode_into_std_write(self, &mut encoder, config)?;
-        Ok(())
-    }
-}
-
-impl Cache {
-    pub fn get(&self, key: &Vec<bool>) -> Option<&Score> {
-        self.data.get(key)
-    }
-
-    pub fn insert(&mut self, key: Vec<bool>, value: Score) {
-        self.data.insert(key, value);
-    }
-}
-
-fn compute_score(individual: &mut Individual, cache: &mut Cache) {
-    individual.compute_score(cache)
-}
-
-fn two_point_crossover(
-    parent1: &Individual,
-    parent2: &Individual,
-    rng: &mut impl Rng,
-) -> (Individual, Individual) {
-    parent1.two_point_crossover(parent2, rng)
-}
+use crate::cache::Cache;
+use crate::individual::Individual;
 
 fn initial_population(
     genome_size: usize,
@@ -213,14 +41,55 @@ fn generate_offspring(population: &[Individual], rng: &mut impl Rng) -> Vec<Indi
     new_population
 }
 
+fn two_point_crossover(
+    parent1: &Individual,
+    parent2: &Individual,
+    rng: &mut impl Rng,
+) -> (Individual, Individual) {
+    parent1.two_point_crossover(parent2, rng)
+}
+
 fn mutate(individual: &mut Individual, rng: &mut impl Rng) {
     individual.mutate(rng)
+}
+
+fn evaluate(individual: &mut Individual) {
+    individual.evaluate();
+}
+
+fn evaluate_cached(individual: &mut Individual, cache: &mut Cache) {
+    let bitstring = individual.bitstring();
+    if let Some(cached) = cache.get(&bitstring) {
+        // Overwrite the stored score:
+        individual.set_summary(*cached);
+    } else {
+        let score = individual.evaluate();
+        // Update global cache:
+        cache.insert(bitstring, score);
+    }
+    // debug_assert!(individual.score.is_some());
+}
+
+fn bitstring(individual: &Individual) -> String {
+    individual.bitstring()
+}
+
+fn fitness(individual: &Individual) -> f64 {
+    individual.summary().count as f64
+}
+
+fn diversity(individual: &Individual, population: &[Individual]) -> f64 {
+    population
+        .iter()
+        .map(|other| (fitness(individual) - fitness(other)).abs())
+        .sum()
 }
 
 pub fn run(
     genome_size: usize,
     population_size: usize,
     num_generations: usize,
+    seed: u64,
     is_plus: bool,
 ) -> std::io::Result<()> {
     let start_time = Instant::now();
@@ -248,32 +117,32 @@ pub fn run(
     let max_fitness = genome_size as f64;
 
     // Seeded random generator:
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(seed);
 
     // Create an initial population:
     let mut population = initial_population(genome_size, population_size, &mut rng);
 
     // Evaluate the initial population:
     for individual in population.iter_mut() {
-        compute_score(individual, &mut cache);
+        // evaluate_cached(individual, &mut cache);
+        evaluate(individual);
     }
 
-    // Sort the initial population in descending order (max first):
-    population.sort_by_key(|x| Reverse(x.score.unwrap()));
+    // Sort the initial population in descending order (best first):
+    population.sort_by_key(|x| Reverse(OrderedFloat(fitness(x))));
 
     let mut best = population[0].clone();
-    let mut best_score = population[0].score.unwrap();
     let mut best_generation = 0;
 
-    println!("Initial generation has size {}", population.len());
+    println!("Initial population has size {}", population.len());
     println!(
-        "Best initial individual has fitness {}: {}",
-        best_score.fitness,
+        "Best initial individual with fitness {}: {}",
+        fitness(&best),
         best.bitstring()
     );
 
     // Check if the stopping condition is met:
-    if (population[0].score.unwrap().fitness - max_fitness).abs() < f64::EPSILON {
+    if (fitness(&population[0]) - max_fitness).abs() < f64::EPSILON {
         println!("[!] Initial population already has max fitness");
     }
 
@@ -305,7 +174,8 @@ pub fn run(
 
         // Evaluate the offspring:
         for individual in offspring.iter_mut() {
-            compute_score(individual, &mut cache);
+            // evaluate_cached(individual, &mut cache);
+            evaluate(individual);
         }
 
         // Update the population:
@@ -317,16 +187,26 @@ pub fn run(
             population = offspring;
         }
 
-        // Sort the population in descending order (max first):
-        population.sort_by_key(|x| Reverse(x.score.unwrap()));
+        // Sort the population in descending order (best first):
+        let scores = population
+            .iter()
+            .map(|this| {
+                let fitness = fitness(this);
+                let diversity = diversity(this, &population);
+                let score = fitness + 0.1 * diversity;
+                score
+            })
+            .collect::<Vec<_>>();
+        let mut scored = population.into_iter().zip(scores).collect::<Vec<_>>();
+        scored.sort_by_key(|(_, s)| Reverse(OrderedFloat(*s)));
+        population = scored.into_iter().map(|(x, _)| x).collect();
 
         // Select best individuals:
         population.truncate(population_size);
 
         // Update the best found individual:
-        if population[0].score.unwrap().fitness > best_score.fitness {
+        if fitness(&population[0]) > fitness(&best) {
             best = population[0].clone();
-            best_score = population[0].score.unwrap();
             best_generation = generation;
         }
 
@@ -341,16 +221,17 @@ pub fn run(
             || (generation % 10000 == 0)
         {
             pb.write(format!(
-                "[{}/{}] Best individual has fitness {}: {}",
+                "[{}/{}] Best individual has fitness {}, diversity {}: {}",
                 generation,
                 num_generations,
-                population[0].score.unwrap().fitness,
+                fitness(&population[0]),
+                diversity(&population[0], &population),
                 population[0].bitstring()
             ))?;
         }
 
         // Check if the stopping condition is met:
-        if (population[0].score.unwrap().fitness - max_fitness).abs() < f64::EPSILON {
+        if (fitness(&best) - max_fitness).abs() < f64::EPSILON {
             pb.write(format!("Reached max fitness on generation {}", generation))?;
             break;
         }
@@ -363,7 +244,7 @@ pub fn run(
     println!(
         "Best individual from generation {} with fitness {}: {}",
         best_generation,
-        best_score.fitness,
+        fitness(&best),
         best.bitstring()
     );
 
