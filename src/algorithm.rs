@@ -193,7 +193,7 @@ pub fn run(
             .map(|this| {
                 let fitness = fitness(this);
                 let diversity = diversity(this, &population);
-                let score = fitness + 0.1 * diversity;
+                let score = fitness + diversity / (population_size as f64);
                 score
             })
             .collect::<Vec<_>>();
